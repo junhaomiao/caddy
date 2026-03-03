@@ -16,7 +16,6 @@ SCRIPT_PATH="/usr/bin/cm"
 
 # [自动安装快捷方式]
 if [[ ! -f "$SCRIPT_PATH" ]]; then
-    # 尝试从你的仓库下载自身
     curl -sL https://raw.githubusercontent.com/junhaomiao/caddy/main/caddy.sh -o $SCRIPT_PATH
     chmod +x $SCRIPT_PATH
 fi
@@ -34,50 +33,41 @@ check_port_usage() {
     fi
 }
 
-# [无提问全自动初始化]
+# [全自动初始化]
 init_env() {
-    echo -e "${BLUE}=== 正在全自动初始化环境 (BBR/Caddy/Dependencies) ===${PLAIN}"
-    
-    # 1. 静默安装依赖
+    echo -e "${BLUE}=== 开始全自动部署 (BBR/Caddy) ===${PLAIN}"
     apt update -y > /dev/null 2>&1
     apt install -y curl lsof psmisc ufw wget debian-keyring debian-archive-keyring apt-transport-https gnupg > /dev/null 2>&1
 
-    # 2. 自动开启 BBR
     if ! sysctl net.ipv4.tcp_congestion_control | grep -q bbr; then
         echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
         echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
         sysctl -p > /dev/null 2>&1
     fi
 
-    # 3. 静默安装 Caddy 官方源
     curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg --yes > /dev/null 2>&1
     curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt > /etc/apt/sources.list.d/caddy-stable.list > /dev/null 2>&1
     apt update -y > /dev/null 2>&1
     apt install -y caddy > /dev/null 2>&1
 
-    # 4. 初始化配置目录
     mkdir -p $SITES_DIR
     echo -e "{\n    servers {\n        protocol {\n            experimental_http3\n        }\n    }\n}\nimport $SITES_DIR/*.conf" > $MAIN_CONFIG
     
-    # 5. 启动服务
     systemctl enable caddy > /dev/null 2>&1
     systemctl restart caddy > /dev/null 2>&1
-    
-    echo -e "${GREEN}初始化完成！快捷方式 'cm' 已生效。${PLAIN}"
+    echo -e "${GREEN}初始化成功！'cm' 命令已可用。${PLAIN}"
     sleep 2
 }
 
 add_site() {
-    read -p "请输入域名 (如 emby.junhaomiao.com): " domain
+    read -p "请输入域名: " domain
     [[ -z "$domain" ]] && return
-    
     read -p "后端IP (默认 127.0.0.1): " upstream_ip
     upstream_ip=${upstream_ip:-127.0.0.1}
-    read -p "后端端口 (如 8880): " upstream_port
-    read -p "外部访问端口 (默认 443): " listen_port
+    read -p "后端端口: " upstream_port
+    read -p "外部端口 (默认 443): " listen_port
     listen_port=${listen_port:-443}
 
-    # 自动处理端口冲突
     check_port_usage $listen_port
 
     cat > $SITES_DIR/$domain.conf <<EOF
@@ -107,9 +97,9 @@ EOF
         echo -e "🔗 访问链接: ${GREEN}https://$domain:$listen_port${PLAIN}"
         echo -e "${GREEN}=======================================${PLAIN}"
         echo ""
-        read -p "按回车返回主菜单..."
+        read -p "按回车返回..."
     else
-        echo -e "${RED}验证失败！配置文件已自动清理。${PLAIN}"
+        echo -e "${RED}验证失败！已清理错误配置。${PLAIN}"
         rm -f $SITES_DIR/$domain.conf
         sleep 2
     fi
@@ -117,14 +107,13 @@ EOF
 
 manage_sites() {
     clear
-    echo -e "${BLUE}=== 站点管理中心 (junhaomiao) ===${PLAIN}"
+    echo -e "${BLUE}=== 站点管理中心 ===${PLAIN}"
     local files=($(ls $SITES_DIR/*.conf 2>/dev/null))
     if [ ${#files[@]} -eq 0 ]; then
         echo "暂无站点。"
         read -p "按回车返回..."
         return
     fi
-
     echo -e "ID\t域名\t\t\t后端"
     echo "------------------------------------------------"
     local i=1
@@ -136,33 +125,51 @@ manage_sites() {
     done
     echo "------------------------------------------------"
     read -p "输入 ID 删除，或 0 返回: " choice
-
     if [[ "$choice" -gt 0 && "$choice" -le ${#files[@]} ]]; then
         rm -f "${files[$((choice-1))]}"
         systemctl reload caddy
-        echo -e "${GREEN}已删除成功。${PLAIN}"
+        echo -e "${GREEN}删除成功。${PLAIN}"
         sleep 1
+    fi
+}
+
+# [全彻底卸载逻辑]
+uninstall_all() {
+    echo -e "${RED}警告：这将删除 Caddy、所有配置及 SSL 证书！${PLAIN}"
+    read -p "确定卸载吗？(y/n): " confirm
+    if [[ "$confirm" == [yY] ]]; then
+        systemctl stop caddy > /dev/null 2>&1
+        systemctl disable caddy > /dev/null 2>&1
+        apt purge -y caddy > /dev/null 2>&1
+        rm -rf /etc/caddy
+        rm -rf /var/lib/caddy
+        rm -f $SCRIPT_PATH
+        echo -e "${GREEN}已彻底卸载并清理残留。${PLAIN}"
+        exit 0
     fi
 }
 
 menu() {
     clear
-    echo -e "${BLUE}Caddy 管理器 v8.5 (junhaomiao)${PLAIN}"
-    echo "1. 初始化环境 (全自动安装/BBR)"
-    echo "2. 添加 Emby 反代站点"
-    echo "3. 管理/删除 反代站点"
+    echo -e "${BLUE}Caddy 管理器 v9.0 (junhaomiao)${PLAIN}"
+    echo "--------------------------------"
+    echo "1. 全自动初始化"
+    echo "2. 添加 Emby 反代"
+    echo "3. 管理/删除 站点"
     echo "4. 查看实时日志"
+    echo "5. 彻底卸载脚本与环境"
     echo "0. 退出"
+    echo "--------------------------------"
     read -p "选择操作: " num
     case "$num" in
         1) init_env ;;
         2) add_site ;;
         3) manage_sites ;;
         4) journalctl -u caddy -f ;;
+        5) uninstall_all ;;
         0) exit 0 ;;
         *) menu ;;
     esac
 }
 
-# 脚本入口
 while true; do menu; done
