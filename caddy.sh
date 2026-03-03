@@ -11,68 +11,65 @@ SITES_DIR="/etc/caddy/sites"
 MAIN_CONFIG="/etc/caddy/Caddyfile"
 SCRIPT_PATH="/usr/bin/cm"
 
-# 1. 权限与依赖预检
+# 权限预检
 [[ $EUID -ne 0 ]] && echo -e "${RED}错误：请以 root 运行。${PLAIN}" && exit 1
 
-# 自动安装基础依赖
-install_deps() {
-    if ! command -v curl &> /dev/null || ! command -v lsof &> /dev/null; then
-        apt update -y && apt install -y curl lsof psmisc ufw wget > /dev/null 2>&1
-    fi
-}
+# [自动安装快捷方式]
+if [[ ! -f "$SCRIPT_PATH" ]]; then
+    # 尝试从你的仓库下载自身
+    curl -sL https://raw.githubusercontent.com/junhaomiao/caddy/main/caddy.sh -o $SCRIPT_PATH
+    chmod +x $SCRIPT_PATH
+fi
 
-# 快捷方式安装
-install_self() {
-    if [[ ! -f "$SCRIPT_PATH" ]]; then
-        # 从你的仓库下载自身
-        curl -sL https://raw.githubusercontent.com/junhaomiao/caddy/main/caddy.sh -o $SCRIPT_PATH
-        chmod +x $SCRIPT_PATH
-    fi
-}
-
-# 端口清理逻辑 (防错：只杀非 Caddy 进程)
+# 端口清理逻辑
 check_port_usage() {
     local port=$1
     local pid=$(lsof -t -i:$port 2>/dev/null)
     if [ -n "$pid" ]; then
-        # 如果占用端口的不是 caddy 本身，则清理
         local pname=$(ps -p $pid -o comm=)
         if [[ "$pname" != "caddy" ]]; then
-            echo -e "${YELLOW}[!] 发现端口 $port 被 $pname 占用，正在清理...${PLAIN}"
             fuser -k $port/tcp > /dev/null 2>&1
             sleep 1
         fi
     fi
 }
 
+# [无提问全自动初始化]
 init_env() {
-    install_deps
-    echo -e "${BLUE}=== 初始化环境 (BBR/Caddy/H3) ===${PLAIN}"
+    echo -e "${BLUE}=== 正在全自动初始化环境 (BBR/Caddy/Dependencies) ===${PLAIN}"
     
-    # BBR 优化
+    # 1. 静默安装依赖
+    apt update -y > /dev/null 2>&1
+    apt install -y curl lsof psmisc ufw wget debian-keyring debian-archive-keyring apt-transport-https gnupg > /dev/null 2>&1
+
+    # 2. 自动开启 BBR
     if ! sysctl net.ipv4.tcp_congestion_control | grep -q bbr; then
         echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
         echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
         sysctl -p > /dev/null 2>&1
     fi
 
-    # 安装 Caddy 官方源
-    apt install -y debian-keyring debian-archive-keyring apt-transport-https > /dev/null 2>&1
-    curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg > /dev/null 2>&1
+    # 3. 静默安装 Caddy 官方源
+    curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg --yes > /dev/null 2>&1
     curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt > /etc/apt/sources.list.d/caddy-stable.list > /dev/null 2>&1
-    apt update -y && apt install -y caddy > /dev/null 2>&1
+    apt update -y > /dev/null 2>&1
+    apt install -y caddy > /dev/null 2>&1
 
+    # 4. 初始化配置目录
     mkdir -p $SITES_DIR
     echo -e "{\n    servers {\n        protocol {\n            experimental_http3\n        }\n    }\n}\nimport $SITES_DIR/*.conf" > $MAIN_CONFIG
     
-    systemctl enable caddy && systemctl restart caddy
-    echo -e "${GREEN}环境初始化成功！${PLAIN}"
-    sleep 1
+    # 5. 启动服务
+    systemctl enable caddy > /dev/null 2>&1
+    systemctl restart caddy > /dev/null 2>&1
+    
+    echo -e "${GREEN}初始化完成！快捷方式 'cm' 已生效。${PLAIN}"
+    sleep 2
 }
 
 add_site() {
     read -p "请输入域名 (如 emby.junhaomiao.com): " domain
-    if [[ -z "$domain" ]]; then return; fi
+    [[ -z "$domain" ]] && return
     
     read -p "后端IP (默认 127.0.0.1): " upstream_ip
     upstream_ip=${upstream_ip:-127.0.0.1}
@@ -80,10 +77,8 @@ add_site() {
     read -p "外部访问端口 (默认 443): " listen_port
     listen_port=${listen_port:-443}
 
+    # 自动处理端口冲突
     check_port_usage $listen_port
-
-    # 临时备份旧配置以防失败
-    [[ -f "$SITES_DIR/$domain.conf" ]] && cp "$SITES_DIR/$domain.conf" "$SITES_DIR/$domain.conf.bak"
 
     cat > $SITES_DIR/$domain.conf <<EOF
 # BACKEND:$upstream_ip:$upstream_port
@@ -102,7 +97,6 @@ $domain:$listen_port {
 }
 EOF
 
-    # 验证配置
     if caddy validate --config $MAIN_CONFIG > /dev/null 2>&1; then
         ufw allow $listen_port/tcp > /dev/null 2>&1
         [[ "$upstream_ip" == "127.0.0.1" ]] && ufw deny $upstream_port/tcp > /dev/null 2>&1
@@ -113,26 +107,21 @@ EOF
         echo -e "🔗 访问链接: ${GREEN}https://$domain:$listen_port${PLAIN}"
         echo -e "${GREEN}=======================================${PLAIN}"
         echo ""
-        read -p "按回车返回菜单..."
+        read -p "按回车返回主菜单..."
     else
-        echo -e "${RED}验证失败！可能是域名解析未生效或格式错误。${PLAIN}"
-        # 回滚
-        if [[ -f "$SITES_DIR/$domain.conf.bak" ]]; then
-            mv "$SITES_DIR/$domain.conf.bak" "$SITES_DIR/$domain.conf"
-        else
-            rm -f $SITES_DIR/$domain.conf
-        fi
+        echo -e "${RED}验证失败！配置文件已自动清理。${PLAIN}"
+        rm -f $SITES_DIR/$domain.conf
         sleep 2
     fi
 }
 
 manage_sites() {
     clear
-    echo -e "${BLUE}=== 站点管理 (junhaomiao) ===${PLAIN}"
+    echo -e "${BLUE}=== 站点管理中心 (junhaomiao) ===${PLAIN}"
     local files=($(ls $SITES_DIR/*.conf 2>/dev/null))
     if [ ${#files[@]} -eq 0 ]; then
         echo "暂无站点。"
-        read -p "返回..."
+        read -p "按回车返回..."
         return
     fi
 
@@ -151,20 +140,20 @@ manage_sites() {
     if [[ "$choice" -gt 0 && "$choice" -le ${#files[@]} ]]; then
         rm -f "${files[$((choice-1))]}"
         systemctl reload caddy
-        echo -e "${GREEN}已删除。${PLAIN}"
+        echo -e "${GREEN}已删除成功。${PLAIN}"
         sleep 1
     fi
 }
 
 menu() {
     clear
-    echo -e "${BLUE}Caddy 管理器 v8.1 (快捷键: cm)${PLAIN}"
-    echo "1. 初始化环境"
-    echo "2. 添加 Emby 反代"
-    echo "3. 管理/删除 站点"
+    echo -e "${BLUE}Caddy 管理器 v8.5 (junhaomiao)${PLAIN}"
+    echo "1. 初始化环境 (全自动安装/BBR)"
+    echo "2. 添加 Emby 反代站点"
+    echo "3. 管理/删除 反代站点"
     echo "4. 查看实时日志"
     echo "0. 退出"
-    read -p "请选择: " num
+    read -p "选择操作: " num
     case "$num" in
         1) init_env ;;
         2) add_site ;;
@@ -175,7 +164,5 @@ menu() {
     esac
 }
 
-# 执行入口
-install_deps
-install_self
+# 脚本入口
 while true; do menu; done
